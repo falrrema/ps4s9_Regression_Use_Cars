@@ -1,0 +1,937 @@
+---
+title: "Car Prices"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+  
+# Introduction  {.tabset .tabset-fade .tabset-pills}
+
+The goal of this competition is to predict car prices.
+
+My notebook serves as a demonstration of some of the possible techniques available to arrive at a solution.  I intend to add to this as I have time available. Your questions and comments are welcome.
+
+If you fork this on kaggle, be sure to choose the kernel Environment setting for "Always use latest environment"
+
+Lets dive right in.
+
+The Kaggle kernels have many of the common r packages built in.  
+
+## Load libraries
+
+In addition to `tidymodels` we will load the `bonsai` interface to lightgbm.
+
+```{r }
+#| label: setup
+#| warning: false
+#| message: false
+
+if (dir.exists("/kaggle")){
+  path <- "/kaggle/input/playground-series-s4e9/"
+
+options(repos = c(CRAN = "https://packagemanager.posit.co/cran/2021-03-22"))
+# install.packages("vip", quiet = TRUE)
+    
+cores <- future::availableCores()
+
+} else {
+  path <- stringr::str_c(here::here("data"),"/")
+
+cores <- future::availableCores(omit = 1)
+}
+
+ 
+suppressPackageStartupMessages({
+library(tidyverse, quietly = TRUE) # metapackage of all tidyverse packages
+library(tidymodels) # metapackage see https://www.tidymodels.org/
+    
+library(tidytext)
+library(textrecipes)
+    
+library(bonsai)
+library(brulee)
+library(stacks)  
+})
+
+tidymodels_prefer()
+
+options(tidymodels.dark = TRUE)
+
+theme_kaggle <- function(){
+  theme_minimal(base_family = "open Sans", base_size = 12) +
+    theme(plot.title.position = "plot")
+}
+
+update_geom_defaults(
+  geom = "text",
+  aes(family = "Open Sans")
+)
+
+
+scale_colour_brewer_d <- function(..., palette = "Spectral") {
+  scale_colour_brewer(..., palette = palette )
+}
+
+scale_fill_brewer_d <- function(..., palette = "Spectral") {
+  scale_fill_brewer(..., palette = palette)
+}
+
+options(
+  ggplot2.discrete.colour = scale_colour_brewer_d,
+  ggplot2.discrete.fill = scale_fill_brewer_d
+)
+
+ggplot2::theme_set(theme_kaggle())
+
+
+```
+
+
+## Load Data
+
+```{r }
+#| label: load data
+#| warning: false
+#| message: false
+
+
+train_spec <- cols(
+  id = col_integer(),
+  brand = col_character(),
+  model = col_character(),
+  model_year = col_integer(),
+  milage = col_integer(),
+  fuel_type = col_character(),
+  engine = col_character(),
+  transmission = col_character(),
+  ext_col = col_character(),
+  int_col = col_character(),
+  accident = col_character(),
+  clean_title = col_character(),
+  price = col_integer()
+)
+
+
+competition_spec <- cols(
+  id = col_integer(),
+  brand = col_character(),
+  model = col_character(),
+  model_year = col_integer(),
+  milage = col_integer(),
+  fuel_type = col_character(),
+  engine = col_character(),
+  transmission = col_character(),
+  ext_col = col_character(),
+  int_col = col_character(),
+  accident = col_character(),
+  clean_title = col_character()
+)
+
+raw_df <- read_csv(str_c(path, "train.csv"),
+                   col_types = train_spec,
+                   show_col_types = FALSE) 
+
+preprocessor <- function(dataframe) {
+
+dataframe <- dataframe %>%
+    janitor::clean_names() %>%
+    
+    mutate(engine = str_replace_all(engine, " Liter", "L")) %>% 
+
+    mutate(transmission = str_replace_all(transmission, "[[:punct:]]", "")) %>% 
+  
+    mutate(transmission = str_replace_all(transmission, "MT", "Manual")) %>% 
+    mutate(transmission = str_replace_all(transmission, "AT", "Automatic")) %>% 
+
+    mutate(transmission = str_replace_all(transmission, "SingleSpeed", "Single")) %>% 
+    mutate(transmission = str_replace_all(transmission, "Single Fixed Gear", "Single")) %>% 
+    
+    mutate(model_length = stringr::str_length(model)) %>%
+    
+    mutate(rounded_milage = case_when(
+                
+      milage %% 10000 == 0 ~ "0000",
+      milage %% 1000 == 0 ~ "000",
+      milage %% 100 == 0 ~ "00",
+      (milage + 1) %% 10 == 0 ~ "9",
+      milage %% 50 == 0 ~ "50",
+      milage %% 5 == 0 ~ "5",
+      milage %% 2 == 0 ~ "2",
+      TRUE ~ "1"
+    )) |> 
+
+  
+    mutate(displacement = parse_number(str_extract(engine, ".{3}(?=L)"))) %>%   
+    mutate(power = parse_number(str_extract(engine, ".{5}(?=HP )"))) %>%   
+    mutate(speeds = parse_number(str_extract(transmission, ".*(?=Speed )"))) %>%   
+  
+    mutate(model = if_else(brand == "Land", str_remove_all(model, "Rover "), model)) %>% 
+    mutate(model = if_else(brand == "Alfa", str_remove(model, "Romeo "), model)) %>% 
+    mutate(model = if_else(brand == "Aston", str_remove(model, "Martin "), model)) %>% 
+      
+    mutate(fuel_type = case_when(
+      
+      str_detect(engine, "Electric") ~ "Electric",
+      str_detect(brand, "Tesla") ~ "Electric",
+      str_detect(engine, "Gasoline") ~ "Gasoline",
+      str_detect(engine, "Diesel") ~ "Diesel",
+      fuel_type == "Diesel" ~ "Diesel",
+      displacement > 0  ~ "Gasoline", 
+
+      TRUE ~ NA_character_      
+      
+    )) 
+
+return(dataframe)
+}
+
+raw_df <- raw_df %>%
+          preprocessor() 
+
+tst_df <- read_csv(str_c(path, "test.csv"),
+                   col_types = competition_spec,
+                   show_col_types = FALSE)  %>% 
+  preprocessor() 
+
+features <- raw_df %>%
+  select(-id, -price) %>%
+  names()
+
+all_df <-
+  bind_rows(
+    raw_df %>% mutate(source = "train") %>%
+      distinct(pick(all_of(features)), .keep_all = TRUE),
+    tst_df %>% mutate(source = "test")
+  )
+
+train_df <- all_df %>% 
+  filter(source == "train") %>% 
+  select(-source) 
+
+competition_df <- all_df %>% 
+  filter(source == "test") %>% 
+  select(-source, -price)
+
+nom_features <- train_df %>%
+  select(all_of(features)) %>%
+  select(where(is.character), where(is.factor)) %>%
+  names() 
+
+logical_features <- train_df %>%
+  select(all_of(features)) %>%
+  select(where(is.logical)) %>%
+  names() 
+
+num_features <- train_df %>%
+  select(all_of(features)) %>%
+  select(where(is.numeric)) %>%
+  names()
+
+```
+
+Nominal features:
+
+`r nom_features`
+
+Numeric features: 
+
+`r num_features`
+
+Logical features: 
+
+`r logical_features`
+
+
+Size of the combined train and competition datasets:
+
+`r nrow(all_df)`
+
+Size of the split made available to machine learning
+
+`r nrow(train_df)`
+
+
+# EDA {.tabset .tabset-fade .tabset-pills}
+
+## Numeric features
+
+Consider where features require univariate transformation, or clipping outliers.
+```{r}
+#| label: numeric
+#| warning: false
+#| message: false
+#| fig.height: 6
+#| fig.width: 12
+
+train_df %>% 
+  select(all_of(num_features), price ) %>% 
+  pivot_longer(-price,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(value, fill = ggplot2::cut_number(price, 5))) +
+  geom_histogram(bins = 200) +
+   facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "top") +
+  labs(color = NULL, fill = NULL,
+       title = "Numeric Feature Univariate Distributions",
+       caption = "Data: Kaggle | Visual: Jim Gruman")
+
+train_df %>% 
+  select(all_of(num_features), price ) %>% 
+  pivot_longer(-price,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(value, price)) +
+  geom_point(shape = 20, alpha = 0.1) +
+   facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "top") +
+  labs(color = NULL, fill = NULL,
+       title = "Numeric Features and Price",
+       caption = "Data: Kaggle | Visual: Jim Gruman")
+
+```
+
+
+## Nominal features
+
+Explore the distribution of outcome class by factor level, and the factor levels that exist in test that do not exist in training.
+
+
+```{r}
+#| label: nominal
+#| warning: false
+#| message: false
+#| fig.height: 18
+#| fig.width: 18
+
+
+if(length(nom_features) >0){
+
+train_df %>% 
+  select(all_of(nom_features), price) %>% 
+  mutate(across(nom_features, fct_lump_n,n = 10, other_level = 'other')) %>%
+  pivot_longer(-price,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+    
+  filter(!is.na(price)) %>% 
+    
+  summarise(n = n(),
+            .by = c(price, metric, value)) %>%
+      
+  mutate(value = tidytext::reorder_within(value, n, metric)) %>%
+    
+  ggplot(aes(x = n, y = value, fill = ggplot2::cut_number(price, 5))) +
+  geom_col() +
+  tidytext::scale_y_reordered() +
+  scale_x_continuous(n.breaks = 3, guide = guide_axis(n.dodge = 2))  +
+  facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+       legend.position = "bottom") +
+  labs(title = "Nominal Feature Counts",
+       fill = NULL,
+       caption = "Data: Kaggle | Visual: Jim Gruman")
+
+}
+
+```
+
+## Text
+
+Many of the model words are distinct to a single brand. Colors, too.
+
+```{r}
+#| label: text
+#| warning: false
+#| message: false
+#| fig.height: 12
+#| fig.width: 12
+
+brand_model_words <- all_df %>% 
+    unnest_tokens(word, model) %>% 
+    count(brand, word, sort = TRUE)
+
+total_words <- brand_model_words %>% 
+  group_by(brand) %>% 
+  summarize(total = sum(n))
+
+brand_tf_idf <- left_join(brand_model_words, total_words) %>%
+  bind_tf_idf(word, brand, n)
+
+brand_tf_idf %>%
+  group_by(brand) %>%
+  slice_max(tf_idf, n = 5) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, tidytext::reorder_within(word,tf_idf, brand))) +
+  geom_col(show.legend = FALSE) +
+  tidytext::scale_y_reordered() +
+  scale_x_continuous(n.breaks = 3) +
+  facet_wrap(~brand, ncol = 6, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title = "Model Designations")
+
+ext_col_model_words <- all_df %>% 
+    unnest_tokens(word, ext_col) %>% 
+    count(brand, word, sort = TRUE)
+
+total_words <- ext_col_model_words %>% 
+  group_by(brand) %>% 
+  summarize(total = sum(n))
+
+ext_col_tf_idf <- left_join(ext_col_model_words, total_words) %>%
+  bind_tf_idf(word, brand, n)
+
+ext_col_tf_idf %>%
+  group_by(brand) %>%
+  slice_max(tf_idf, n = 5) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, tidytext::reorder_within(word,tf_idf, brand))) +
+  geom_col(show.legend = FALSE) +
+  tidytext::scale_y_reordered() +
+  scale_x_continuous(n.breaks = 3) +
+  facet_wrap(~brand, ncol = 6, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title = "External Colors")
+
+int_col_model_words <- all_df %>% 
+    unnest_tokens(word, int_col) %>% 
+    count(brand, word, sort = TRUE)
+
+total_words <- int_col_model_words %>% 
+  group_by(brand) %>% 
+  summarize(total = sum(n))
+
+int_col_tf_idf <- left_join(int_col_model_words, total_words) %>%
+  bind_tf_idf(word, brand, n)
+
+int_col_tf_idf %>%
+  group_by(brand) %>%
+  slice_max(tf_idf, n = 5) %>%
+  ungroup() %>%
+  ggplot(aes(tf_idf, tidytext::reorder_within(word,tf_idf, brand))) +
+  geom_col(show.legend = FALSE) +
+  tidytext::scale_y_reordered() +
+  scale_x_continuous(n.breaks = 3) +
+  facet_wrap(~brand, ncol = 6, scales = "free") +
+  labs(x = "tf-idf", y = NULL, title = "Internal Colors")
+
+
+```
+
+## Ford 
+
+How well does the simplest linear model fit for a single brand, for the majority of records in the dataset?  What features may offer the most gain, the most importance?
+
+```{r}
+#| label: Ford
+#| warning: false
+#| message: false
+#| fig.height: 6
+#| fig.width: 6
+
+
+rec <- recipe(formula(paste0("price ~ ", str_c(features, collapse = " + "))), data = train_df |> filter(brand == "Ford")) %>%
+  
+  step_impute_median(all_numeric_predictors()) |>
+  step_impute_mode(all_nominal_predictors()) |>
+  
+  textrecipes::step_tokenize(engine, model, transmission) %>%
+  textrecipes::step_tokenmerge(engine, model, transmission) %>%
+  textrecipes::step_tokenfilter(tokenmerge, max_tokens = 120L) %>%                 
+  textrecipes::step_tf(tokenmerge) %>%
+  
+  update_role(brand, clean_title, new_role = "id variable") %>%
+
+  embed::step_embed(int_col, 
+                    num_terms = 2,
+                    hidden_units = 3,
+                    options = embed::embed_control(
+                      loss = "mse",
+                      optimizer = "adam",
+                      epochs = 20,
+                      validation_split = 0,
+                      batch_size = 32,
+                      verbose = 0
+                    ),
+                    outcome = vars(price)) |> 
+  
+  embed::step_embed(ext_col, 
+                    num_terms = 2,
+                    hidden_units = 3,
+                    options = embed::embed_control(
+                      loss = "mse",
+                      optimizer = "adam",
+                      epochs = 20,
+                      validation_split = 0,
+                      batch_size = 32,
+                      verbose = 0
+                    ),
+                    outcome = vars(price)) |> 
+  
+  embed::step_embed(rounded_milage, 
+                   num_terms = 2,
+                   hidden_units = 3,
+                   options = embed::embed_control(
+                     loss = "mse",
+                      optimizer = "adam",
+                     epochs = 20,
+                     validation_split = 0,
+                     batch_size = 32,
+                     verbose = 0
+                   ),
+                   outcome = vars(price)) |> 
+  
+  # embed::step_embed(brand, 
+  #                   num_terms = 2,
+  #                   hidden_units = 3,
+  #                   options = embed::embed_control(
+  #                     loss = "mse",
+  #                     optimizer = "rmsprop",
+  #                     epochs = 50,
+  #                     validation_split = 0,
+  #                     batch_size = 32,
+  #                     verbose = 1
+  #                   ),
+  #                   outcome = vars(price)) |> 
+  
+  
+  step_dummy(fuel_type, accident) |> 
+  
+  step_zv(all_predictors()) |>
+  step_normalize(all_predictors())
+
+linear_reg_glm_spec <-
+  linear_reg() %>%
+  set_engine('glm')
+
+wf <- workflow(rec, linear_reg_glm_spec)
+
+linear_fit <- wf %>%
+  fit(data = train_df |> filter(brand == "Ford"))
+
+augment(linear_fit, train_df |> filter(brand == "Ford")) %>%
+  rmse(price, .pred)
+
+linear_fit %>%
+  extract_fit_parsnip() %>% 
+  tidy() %>%
+  filter(p.value < 0.05, term != "(Intercept)") |>
+  ggplot(aes(estimate, fct_reorder(term, estimate))) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = estimate - std.error, xmax = estimate + std.error)) +
+  labs(title = "A Ford Model", x = "Linear Coefficient", y = NULL)
+
+
+
+augment(linear_fit, train_df |> filter(brand == "Ford")) %>%
+  ggplot(aes(price, .pred)) +
+  geom_abline(lty = 2,
+              color = "green",
+              linewidth = 1.5) +
+  geom_point(alpha = 0.1, shape = 20) +
+  labs(
+    x = "Truth",
+    y = "Predicted Price",
+    title = "Ford Linear Model Predictions",
+    subtitle = "Some negative preds.  And missing the $3M elite models.",
+    color = NULL
+  )
+
+```
+
+
+## Counts of Missingness
+                  
+```{r}
+#| label: counts of missingness
+
+#naniar::gg_miss_upset(train_df,  nintersects = 6) 
+
+#naniar::vis_miss(train_df |> slice_sample(prop = 0.01))
+
+train_df %>% 
+  summarize(across(all_of(features), function(x) sum(is.na(x)))) %>% 
+  pivot_longer(everything(),
+              names_to = "feature",
+              values_to = "Count of Missing") %>% 
+                   knitr::kable()
+                   
+
+                  
+```
+
+## Counts of Distinct
+                   
+               
+```{r}
+#| label: counts of distinct
+               
+train_df %>%
+  summarize(across(all_of(features), n_distinct)) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "Count of distinct train") |>
+  left_join(
+    tst_df %>%
+      summarize(across(all_of(features), n_distinct)) %>%
+      pivot_longer(everything(), names_to = "feature", values_to = "Count of distinct test")
+  ) %>% 
+                   knitr::kable()
+
+
+               
+```
+
+## Duplicated
+
+Is this competition transaction already in the training data with a correct label?
+
+It looks like we had had a few car models with more than one selling price.
+
+The test set has 81 entries that appear in train, and 24 that appear twice in test.
+
+```{r}
+#| label: duplicates
+#| warning: false
+#| message: false
+
+all_df %>%
+    group_by_at(features) %>%
+    mutate(num_dups = n(),
+           dup_id = row_number()) %>% 
+    ungroup() %>%
+    group_by(source) %>%
+    mutate(is_duplicated = dup_id > 1) %>% 
+    count(is_duplicated) %>% 
+                   knitr::kable()
+
+
+
+
+```
+                   
+
+
+
+## Target
+
+There are some strange exotic cars on the top end of this distribution. There are odd bins at exactly 2,954,083, 1,950,995, 1,599,000 and so on. 
+
+These are all positive integers.
+
+```{r}
+#| label: outcome 
+#| warning: false
+#| message: false
+#| fig.width: 6
+
+train_df |> count(price) |> arrange(desc(price))                   
+                   
+train_df %>% 
+  ggplot(aes(price)) +
+  geom_histogram(bins = 100) +
+  scale_x_log10(labels = scales::comma) +
+  labs(title = "Car prices",
+       caption = "Data: Kaggle.com | Visual: Jim Gruman")
+
+
+
+```
+ 
+           
+                
+# Regression Machine Learning {.tabset .tabset-fade .tabset-pills}
+
+
+## Recipe
+
+```{r}
+#| label: recipe
+#| warning: false
+#| message: false
+#| fig.width: 6
+                   
+rec <- recipe(formula(paste0("price ~ ", str_c(features, collapse = " + "))), data = train_df) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+ 
+  textrecipes::step_tokenize(int_col, ext_col, engine, model, transmission) %>%
+
+  textrecipes::step_tokenfilter(int_col, max_tokens = 10L) %>%                 
+  textrecipes::step_tfidf(int_col) %>%
+
+  textrecipes::step_tokenfilter(ext_col, max_tokens = 10L) %>%                 
+  textrecipes::step_tfidf(ext_col) %>%
+  
+  textrecipes::step_tokenmerge(engine, model, transmission) %>%
+  textrecipes::step_tokenfilter(tokenmerge, max_tokens = 140L) %>%                 
+  textrecipes::step_tfidf(tokenmerge) %>%
+                   
+  step_zv(all_predictors())
+
+folds <- vfold_cv(train_df,
+                  v = 6,
+                  repeats = 1,
+                  strata = price)
+                   
+ctrl <- stacks::control_stack_resamples( )  
+                   
+```
+
+
+
+## Lightgbm
+
+```{r}
+#| label: lgbm
+#| fig.height: 6
+#| fig.width: 6   
+
+boost_tree_lgbm_spec <- 
+  boost_tree(
+    trees = 1250,
+   tree_depth = tune(),
+   learn_rate =  tune(),
+   min_n = tune(),
+   loss_reduction = 0
+  ) %>% 
+  set_engine(engine = "lightgbm",
+             is_unbalance = TRUE,
+             num_leaves = tune(),
+             num_threads = cores
+             ) %>%
+  set_mode(mode = "regression") 
+                   
+wf <- workflow(rec,
+               boost_tree_lgbm_spec) 
+
+param <- wf %>%
+   extract_parameter_set_dials() %>%
+   recipes::update(
+      min_n = min_n(range = c(5,30)),
+      tree_depth = tree_depth(range = c(15,50)),
+      learn_rate = learn_rate(range = c(-1.5,-3.5)),
+      num_leaves = num_leaves(range = c(150,250))
+   ) %>%
+   dials::finalize(train_df)                 
+
+lgbm_rs <- tune_grid(
+  wf,
+  grid = 11,
+  resamples = folds,
+  control = ctrl,
+  metrics = metric_set(rmse, mae),
+  param_info = param)
+                          
+
+show_best(lgbm_rs, metric = "rmse")  
+
+autoplot(lgbm_rs)
+
+collect_metrics(lgbm_rs) %>% 
+  filter(.metric == "rmse") %>% 
+  mutate(.config = fct_reorder(.config, -mean)) %>% 
+  ggplot(aes(mean, .config)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = mean - std_err, xmax = mean + std_err)) +
+  labs(title = "RMSE across resample folds with std_err")
+                   
+
+```
+                   
+## Torch NN
+                   
+```{r}
+#| label: torch
+#| warning: false
+#| message: false
+#| fig.height: 6
+#| fig.width: 6      
+                   
+mlp_brulee_spec <-
+  mlp(hidden_units = 5L, 
+      epochs = 200, 
+      dropout = tune(), 
+      learn_rate = 0.0005, 
+      ) %>%
+  set_engine('brulee',
+             rate_schedule = "cyclic",
+             validation = 0.05,
+             stop_iter = 10L) %>%
+  set_mode('regression')
+
+rec <- recipe(formula(paste0("price ~ ", str_c(features, collapse = " + "))), data = train_df) %>%
+  
+  step_novel(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  
+  step_impute_median(all_numeric_predictors()) |>
+  step_impute_mode(all_nominal_predictors()) |>
+  
+  textrecipes::step_tokenize(engine, model, transmission) %>%
+  textrecipes::step_tokenmerge(engine, model, transmission) %>%
+  textrecipes::step_tokenfilter(tokenmerge, max_tokens = 120L) %>%                 
+  textrecipes::step_tf(tokenmerge) %>%
+  
+  update_role(brand, clean_title, new_role = "id variable") %>%
+  
+  embed::step_embed(int_col, 
+                    num_terms = 2,
+                    hidden_units = 3,
+                    options = embed::embed_control(
+                      loss = "mse",
+                      optimizer = "adam",
+                      epochs = 20,
+                      validation_split = 0,
+                      batch_size = 32,
+                      verbose = 0
+                    ),
+                    outcome = vars(price)) |> 
+  
+  embed::step_embed(ext_col, 
+                    num_terms = 2,
+                    hidden_units = 3,
+                    options = embed::embed_control(
+                      loss = "mse",
+                      optimizer = "adam",
+                      epochs = 20,
+                      validation_split = 0,
+                      batch_size = 32,
+                      verbose = 0
+                    ),
+                    outcome = vars(price)) |> 
+  
+  embed::step_embed(rounded_milage, 
+                    num_terms = 2,
+                    hidden_units = 3,
+                    options = embed::embed_control(
+                      loss = "mse",
+                      optimizer = "adam",
+                      epochs = 20,
+                      validation_split = 0,
+                      batch_size = 32,
+                      verbose = 0
+                    ),
+                    outcome = vars(price)) |> 
+  
+  embed::step_embed(brand,
+                    num_terms = 2,
+                    hidden_units = 3,
+                    options = embed::embed_control(
+                      loss = "mse",
+                      optimizer = "adam",
+                      epochs = 100,
+                      validation_split = 0,
+                      batch_size = 32,
+                      verbose = 0
+                    ),
+                    outcome = vars(price)) |>
+  
+  
+  step_dummy(fuel_type, accident) |> 
+  
+  step_zv(all_predictors()) |>
+  step_normalize(all_predictors())
+                   
+wf <- workflow(rec,
+               mlp_brulee_spec) 
+
+ param <- wf %>%
+   extract_parameter_set_dials() %>%
+   recipes::update(
+      dropout = dropout(range = c(0,0.1))) %>%
+   dials::finalize(train_df)                    
+                   
+brulee_rs <- tune_grid(wf,
+                       grid = 3,
+  resamples = folds,
+  control = ctrl,
+  metrics = metric_set(rmse, mae),
+  param_info = param)                   
+                   
+autoplot(brulee_rs)
+
+collect_metrics(brulee_rs) %>% 
+  filter(.metric == "rmse") %>% 
+  mutate(.config = fct_reorder(.config, -mean)) %>% 
+  ggplot(aes(mean, .config)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = mean - std_err, xmax = mean + std_err)) +
+  labs(title = "RMSE across resample folds with std_err")                   
+```      
+                   
+## Stacks Ensemble                   
+                   
+```{r}
+#| label: stacks
+#| warning: false
+#| message: false
+#| fig.height: 6
+#| fig.width: 6  
+car_values_st <- 
+  stacks() %>%
+  add_candidates(brulee_rs) %>%
+  add_candidates(lgbm_rs) %>%
+  blend_predictions(      
+      metric = metric_set(rmse),
+      penalty = c(10^seq(-1.1, -0.1, 0.1)),
+      non_negative = TRUE,
+      control = tune::control_grid(allow_par = TRUE))
+                   
+autoplot(car_values_st)                   
+                   
+autoplot(car_values_st, type = "weights")        
+                   
+car_model <-
+  car_values_st %>%
+  fit_members()                     
+                   
+                   
+``` 
+                   
+# Submission
+                   
+                   
+```{r}
+#| label: submission
+#| warning: false
+#| message: false
+#| fig.height: 6
+#| fig.width: 6                    
+                   
+augment(car_model, train_df) %>% 
+  ggplot(aes(.pred, price)) +
+  geom_point(alpha = 0.1, shape = 20) +
+  geom_abline(color = "green") 
+
+
+submit_df <-  augment(
+  car_model,
+  ## some of the competition set cars are in the training set
+  competition_df %>%
+    left_join(train_df %>% select(-id), by = all_of(features)) %>%
+    rename(train_price = price)
+) %>%
+  mutate(price = if_else(is.na(train_price), .pred, train_price)) %>% 
+  select(id, price) %>%
+  mutate(price = if_else(price < 2000, 2000, price))
+
+
+head(submit_df)  %>% 
+     knitr::kable()      
+
+submit_df  %>% 
+  write_csv("submission.csv")
+```  
